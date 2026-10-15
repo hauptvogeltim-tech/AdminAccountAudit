@@ -1,0 +1,13 @@
+# Laufzeitdaten, falls Storage/Logging auf Pfade im Projektordner gestellt werden
+runs/
+audit/
+logs/
+*.jsonl
+diag-*.log
+run-*.json
+
+# Exporte aus Testlaeufen
+*.csv
+
+# Lokale Konfigurationskopien (z. B. mit echten Hostnamen / SMTP-Daten)
+Config/*.local.json
