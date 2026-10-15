@@ -168,6 +168,8 @@ function Invoke-AuditMethod {
     $r = New-AuditMethodResult -Collector $Collector -Method $Method -HostInfo $HostInfo
     $sb = New-AuditMethodScriptBlock -Script $Method.Script
     $transports = @($Method.Transports)
+    $component = $Collector.Name + '/' + $Method.Name
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
     for ($i = 0; $i -lt $transports.Count; $i++) {
         $t = $transports[$i]
@@ -179,13 +181,16 @@ function Invoke-AuditMethod {
             # Nicht ausfuehren ist eine Aussage ('Skipped'), kein Fund "nichts da"
             [void]$r.TransportNotes.Add("$t`: skipped - $incompatible")
             $r.Status = 'Skipped'; $r.Message = "$t`: skipped - $incompatible"
+            Write-AuditLog -Level Info -Component $component -HostName $HostInfo.Name -Message "Transport $t skipped: $incompatible"
             continue
         }
+        Write-AuditLog -Level Verbose -Component $component -HostName $HostInfo.Name -Message "Running via $t"
         try {
             if ($t -eq 'WinRM') {
                 if ($null -eq $Session) {
                     [void]$r.TransportNotes.Add("WinRM: $SessionError")
                     $r.Status = 'Unreachable'; $r.Message = "WinRM: $SessionError"
+                    if (-not $isLast) { Write-AuditLog -Level Verbose -Component $component -HostName $HostInfo.Name -Message 'No WinRM session - trying next transport' }
                     continue
                 }
                 $out = Invoke-Command -Session $Session -ScriptBlock $sb -ArgumentList @($null, $Target, $Options) -ErrorAction Stop
@@ -200,6 +205,13 @@ function Invoke-AuditMethod {
             $r.Result = @($out | Where-Object { $null -ne $_ -and $_.PSObject.Properties['Records'] }) | Select-Object -Last 1
             if ($null -eq $r.Result) { throw 'Method script returned no result object' }
             $r.Status = 'Ok'; $r.Message = ''
+            # Meldungen des Zielhosts ins Diagnose-Log uebernehmen
+            foreach ($e in @($r.Result.Log)) {
+                if ($null -eq $e) { continue }
+                $lvl = [string]$e.Level
+                if (@('Error', 'Warning', 'Info', 'Verbose', 'Debug') -notcontains $lvl) { $lvl = 'Info' }
+                Write-AuditLog -Level $lvl -Component ('Remote:' + $component) -HostName $HostInfo.Name -Message ([string]$e.Message) -Time $e.Time
+            }
             break
         }
         catch {
@@ -210,10 +222,18 @@ function Invoke-AuditMethod {
             $r.Message = $msg
             # Naechsten Transport nur versuchen, wenn der Fehler am Transport lag
             $transportBroken = ($kind -eq 'Unreachable') -or ($t -eq 'WinRM' -and $Session -and $Session.State -ne 'Opened')
-            if (-not $transportBroken -or $isLast) { break }
+            $fallback = $transportBroken -and -not $isLast
+            Write-AuditLog -Level $(if ($fallback) { 'Info' } else { 'Warning' }) -Component $component -HostName $HostInfo.Name `
+                -Message ("Failed via $t ($kind)" + $(if ($fallback) { ' - trying next transport' } else { '' })) -ErrorRecord $_
+            if (-not $fallback) { break }
         }
     }
     $r.EndedAt = Get-AuditUtcNow
+    $sw.Stop()
+    $count = if ($r.Result) { @($r.Result.Records).Count } else { 0 }
+    Write-AuditLog -Level $(if ($r.Status -in 'Ok', 'Skipped') { 'Verbose' } else { 'Warning' }) -Component $component -HostName $HostInfo.Name `
+        -Message ("Finished: {0} via {1}, {2} records, {3:n1}s" -f $r.Status, $r.Transport, $count, $sw.Elapsed.TotalSeconds) `
+        -Data $(if ($r.Status -ne 'Ok' -and $r.Message) { @{ Message = $r.Message } } else { $null })
     $r
 }
 
@@ -226,6 +246,7 @@ function Get-AuditMethodOption {
     $o['HostName'] = $HostInfo.Name
     $o['HostShortName'] = $HostInfo.ShortName
     $o['IsDomainController'] = [bool]$HostInfo.IsDomainController
+    $o['LogLevel'] = Get-AuditEffectiveLogLevel
     $o
 }
 
@@ -239,10 +260,15 @@ function Invoke-AuditHostJob {
         [Parameter(Mandatory)][string[]]$CollectorNames,
         [Parameter(Mandatory)][hashtable]$Target,
         [Parameter(Mandatory)][hashtable]$Config,
-        [Parameter(Mandatory)][hashtable]$State
+        [Parameter(Mandatory)][hashtable]$State,
+        [string]$RunId = ''
     )
     $State.StartedAt = Get-AuditUtcNow
     $State.Phase = 'Prepare'
+    # Eigener Runspace = eigene Modulinstanz -> Logging hier erneut initialisieren (ohne Bereinigung)
+    if ($Config.Logging) { Initialize-AuditLogging -Settings $Config.Logging -RunId $RunId -NoMaintenance }
+    Write-AuditLog -Level Verbose -Component 'HostJob' -HostName $HostInfo.Name -Message 'Host job started' `
+        -Data @{ IsDomainController = [bool]$HostInfo.IsDomainController; OS = $HostInfo.OperatingSystem; OSVersion = $HostInfo.OperatingSystemVersion }
     $collectors = @(Get-AuditCollector -Name $CollectorNames -Path (Get-AuditCollectorPath $Config))
     $plan = foreach ($c in $collectors) { foreach ($m in Get-AuditApplicableMethod -Collector $c -HostInfo $HostInfo) { @{ Collector = $c; Method = $m } } }
     $plan = @($plan)
@@ -252,6 +278,7 @@ function Invoke-AuditHostJob {
     $State.Phase = 'DNS'
     $dnsError = $null
     try { [void][System.Net.Dns]::GetHostAddresses($HostInfo.Name) } catch { $dnsError = $_.Exception.Message }
+    if ($dnsError) { Write-AuditLog -Level Warning -Component 'HostJob' -HostName $HostInfo.Name -Message "DNS resolution failed: $dnsError" }
 
     $session = $null
     $sessionError = 'not attempted'
@@ -267,10 +294,12 @@ function Invoke-AuditHostJob {
             $session = New-PSSession -ComputerName $HostInfo.Name -SessionOption $opt -ErrorAction Stop
             $State.RemotePSVersion = [string](Invoke-Command -Session $session -ScriptBlock { $PSVersionTable.PSVersion.ToString() } -ErrorAction Stop)
             $sessionError = ''
+            Write-AuditLog -Level Verbose -Component 'HostJob' -HostName $HostInfo.Name -Message "WinRM session open, remote PowerShell $($State.RemotePSVersion)"
         }
         catch {
             $sessionError = $_.Exception.Message
             if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue; $session = $null }
+            Write-AuditLog -Level Info -Component 'HostJob' -HostName $HostInfo.Name -Message 'WinRM not available - methods will use their fallback transports' -ErrorRecord $_
         }
     }
     $State.WinRM = if ($session) { 'Ok' } else { $sessionError }
@@ -292,6 +321,7 @@ function Invoke-AuditHostJob {
                 catch {
                     $r = New-AuditMethodResult -Collector $item.Collector -Method $item.Method -HostInfo $HostInfo
                     $r.Status = 'Error'; $r.Message = $_.Exception.Message; $r.EndedAt = Get-AuditUtcNow
+                    Write-AuditLog -Level Error -Component ($item.Collector.Name + '/' + $item.Method.Name) -HostName $HostInfo.Name -Message 'Unexpected runner error' -ErrorRecord $_
                 }
             }
             [void]$State.Results.Add($r)
@@ -300,6 +330,7 @@ function Invoke-AuditHostJob {
     finally {
         if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
         $State.Phase = 'Done'
+        Write-AuditLog -Level Verbose -Component 'HostJob' -HostName $HostInfo.Name -Message ("Host job done after {0:n1}s" -f ((Get-AuditUtcNow) - [datetime]$State.StartedAt).TotalSeconds)
     }
 }
 
@@ -316,7 +347,8 @@ function Invoke-AuditCollection {
         [Parameter(Mandatory)][hashtable]$Target,
         [Parameter(Mandatory)][object[]]$Hosts,
         [Parameter(Mandatory)][string[]]$CollectorNames,
-        [hashtable]$Status
+        [hashtable]$Status,
+        [string]$RunId = ''
     )
     if (-not $Status) { $Status = [hashtable]::Synchronized(@{}) }
     $Status.HostsTotal = $Hosts.Count
@@ -331,6 +363,8 @@ function Invoke-AuditCollection {
     $iss.ImportPSModule(@($script:AuditModuleManifest))
     $pool = [runspacefactory]::CreateRunspacePool(1, $max, $iss, $Host)
     $pool.Open()
+    Write-AuditLog -Level Info -Component 'Runner' -Message ("Collecting from {0} hosts, {1} in parallel, host timeout {2}s, mode {3}" -f `
+        $Hosts.Count, $max, [int]$timeout.TotalSeconds, $Config.Collection.CompatibilityMode) -Data @{ Collectors = $CollectorNames }
 
     $jobs = New-Object System.Collections.ArrayList
     foreach ($h in $Hosts) {
@@ -342,7 +376,7 @@ function Invoke-AuditCollection {
         $ps = [powershell]::Create()
         $ps.RunspacePool = $pool
         [void]$ps.AddCommand('Invoke-AuditHostJob').AddParameters(@{
-            HostInfo = $h; CollectorNames = $CollectorNames; Target = $Target; Config = $Config; State = $state
+            HostInfo = $h; CollectorNames = $CollectorNames; Target = $Target; Config = $Config; State = $state; RunId = $RunId
         })
         [void]$jobs.Add(@{ Ps = $ps; Handle = $ps.BeginInvoke(); Host = $h; State = $state; Done = $false; TimedOut = $false; JobError = '' })
     }
@@ -353,6 +387,7 @@ function Invoke-AuditCollection {
             if ($j.Handle.IsCompleted) {
                 try { [void]$j.Ps.EndInvoke($j.Handle) } catch { $j.JobError = $_.Exception.Message }
                 if ($j.Ps.Streams.Error.Count -gt 0 -and -not $j.JobError) { $j.JobError = [string]$j.Ps.Streams.Error[0] }
+                if ($j.JobError) { Write-AuditLog -Level Error -Component 'Runner' -HostName $j.Host.Name -Message "Host job failed: $($j.JobError)" }
                 $j.Done = $true
                 $j.Ps.Dispose()
                 $Status.HostsDone++
@@ -361,6 +396,7 @@ function Invoke-AuditCollection {
                 # Nicht blockierend stoppen: ein haengender RPC-Aufruf darf den Lauf nicht festhalten
                 [void]$j.Ps.BeginStop($null, $null)
                 $j.TimedOut = $true
+                Write-AuditLog -Level Warning -Component 'Runner' -HostName $j.Host.Name -Message ("Host timeout after {0}s in phase '{1}' - finished methods are kept" -f [int]$timeout.TotalSeconds, $j.State.Phase)
                 $j.Done = $true
                 $Status.HostsDone++
             }

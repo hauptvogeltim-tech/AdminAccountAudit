@@ -665,6 +665,164 @@ Test-Case 'local administrator is reported only when enabled' {
     Assert-Equal 'SRV01\Administrator' $local[0].Account
 }
 
+# ============================================================================ Diagnose-Log
+Write-Host 'Diagnostic log'
+
+function New-TempDir { $d = Join-Path ([System.IO.Path]::GetTempPath()) ('aa-log-' + [guid]::NewGuid().ToString('N')); [void](New-Item -ItemType Directory -Path $d); $d }
+
+Test-Case 'level threshold: only entries at or above the level reach the file' {
+    $d = New-TempDir
+    try {
+        Initialize-AuditLogging -Settings @{ Level = 'Warning'; ConsoleLevel = 'Off'; Directory = $d } -RunId 'run-aaaa-1111'
+        Write-AuditLog -Level Info -Message 'info hidden'
+        Write-AuditLog -Level Verbose -Message 'verbose hidden'
+        Write-AuditLog -Level Warning -Message 'warn shown' -HostName 'srv01'
+        Write-AuditLog -Level Error -Message 'error shown'
+        $e = @(Get-AuditLogEntry -Directory $d)
+        Assert-Equal 2 $e.Count (($e | ForEach-Object { $_.Message }) -join ', ')
+        Assert-Equal 'srv01' $e[0].Host
+        Assert-Equal 'run-aaaa' $e[0].RunId
+        Set-AuditLogLevel Debug
+        Write-AuditLog -Level Debug -Message 'debug now shown'
+        Assert-Equal 3 @(Get-AuditLogEntry -Directory $d).Count
+        Assert-Equal 'Debug' (Get-AuditLogLevel).Level
+    }
+    finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'level Off writes no file at all' {
+    $d = New-TempDir
+    try {
+        Initialize-AuditLogging -Settings @{ Level = 'Off'; ConsoleLevel = 'Off'; Directory = $d }
+        Write-AuditLog -Level Error -Message 'nothing'
+        Assert-Equal 0 @(Get-ChildItem -LiteralPath $d).Count
+    }
+    finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'text format round-trips data, filters by level/host/component/pattern/last' {
+    $d = New-TempDir
+    try {
+        Initialize-AuditLogging -Settings @{ Level = 'Debug'; ConsoleLevel = 'Off'; Directory = $d } -RunId 'abcdef0123456789'
+        Write-AuditLog -Level Info -Component 'Runner' -HostName 'srv01.corp.local' -Message 'with | pipe and data' -Data @{ Count = 3; Names = @('a', 'b') }
+        Write-AuditLog -Level Verbose -Component 'Logon/SecurityLog' -HostName 'srv02.corp.local' -Message 'second'
+        Write-AuditLog -Level Debug -Component 'Runner' -Message 'third'
+        $all = @(Get-AuditLogEntry -Directory $d)
+        Assert-Equal 3 $all.Count
+        Assert-Equal 'with | pipe and data' $all[0].Message
+        Assert-Equal 3 $all[0].Data.Count
+        Assert-Equal 2 @(Get-AuditLogEntry -Directory $d -Level Verbose).Count
+        Assert-Equal 1 @(Get-AuditLogEntry -Directory $d -HostName 'srv02').Count
+        Assert-Equal 2 @(Get-AuditLogEntry -Directory $d -Component 'Runner').Count
+        Assert-Equal 1 @(Get-AuditLogEntry -Directory $d -Pattern '^sec').Count
+        Assert-Equal 'third' (@(Get-AuditLogEntry -Directory $d -Last 1)[0]).Message
+        Assert-Equal 3 @(Get-AuditLogEntry -Directory $d -RunId 'abcdef01').Count
+        Assert-Equal 0 @(Get-AuditLogEntry -Directory $d -RunId 'ffffffff').Count
+    }
+    finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'JSON format round-trips' {
+    $d = New-TempDir
+    try {
+        Initialize-AuditLogging -Settings @{ Level = 'Info'; ConsoleLevel = 'Off'; Directory = $d; Format = 'Json' }
+        Write-AuditLog -Level Warning -Component 'X' -Message 'json entry' -Data @{ A = 1 }
+        $e = @(Get-AuditLogEntry -Directory $d)
+        Assert-Equal 1 $e.Count
+        Assert-Equal 'json entry' $e[0].Message
+        Assert-Equal 1 $e[0].Data.A
+        Assert-True ((Get-Content -LiteralPath (Get-ChildItem $d)[0].FullName -Raw).TrimStart().StartsWith('{'))
+    }
+    finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'sensitive values are masked, exceptions recorded' {
+    $d = New-TempDir
+    try {
+        Initialize-AuditLogging -Settings @{ Level = 'Debug'; ConsoleLevel = 'Off'; Directory = $d }
+        try { throw 'boom' } catch { $err = $_ }
+        Write-AuditLog -Level Error -Message 'x' -Data @{ SmtpPassword = 'geheim'; Nested = @{ Credential = 'c' }; User = 'u' } -ErrorRecord $err
+        $raw = Get-Content -LiteralPath (Get-ChildItem $d)[0].FullName -Raw
+        Assert-True ($raw -notmatch 'geheim') 'password leaked'
+        $e = @(Get-AuditLogEntry -Directory $d)[0]
+        Assert-Equal '***' $e.Data.SmtpPassword
+        Assert-Equal '***' $e.Data.Nested.Credential
+        Assert-True ($e.Data.Exception -like '*boom*') $e.Data.Exception
+        Assert-True ($e.Data.StackTrace) 'stack trace at Debug'
+    }
+    finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'size rotation and retention' {
+    $d = New-TempDir
+    try {
+        $old = Join-Path $d 'diag-20200101.log'
+        Set-Content -LiteralPath $old -Value 'old'
+        (Get-Item $old).LastWriteTime = (Get-Date).AddDays(-40)
+        Initialize-AuditLogging -Settings @{ Level = 'Info'; ConsoleLevel = 'Off'; Directory = $d; MaxFileSizeMB = 0.001; RetentionDays = 30 }
+        Assert-True (-not (Test-Path -LiteralPath $old)) 'old file must be removed'
+        for ($i = 0; $i -lt 40; $i++) { Write-AuditLog -Level Info -Message ('line {0} {1}' -f $i, ('x' * 60)) }
+        $files = @(Get-ChildItem -LiteralPath $d -Filter 'diag-*.log')
+        Assert-True ($files.Count -ge 2) "expected rotation, got $($files.Count) file(s)"
+        Assert-Equal 40 @(Get-AuditLogEntry -Directory $d).Count
+    }
+    finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'parallel writers from several runspaces do not corrupt the file' {
+    $d = New-TempDir
+    try {
+        $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+        $iss.ImportPSModule(@((Join-Path $root 'AdminAudit.psd1')))
+        $pool = [runspacefactory]::CreateRunspacePool(1, 4, $iss, $Host); $pool.Open()
+        $jobs = foreach ($w in 1..4) {
+            $ps = [powershell]::Create(); $ps.RunspacePool = $pool
+            [void]$ps.AddScript({
+                param($Dir, $W)
+                Initialize-AuditLogging -Settings @{ Level = 'Info'; ConsoleLevel = 'Off'; Directory = $Dir } -NoMaintenance
+                for ($i = 0; $i -lt 150; $i++) { Write-AuditLog -Level Info -Component "W$W" -Message "msg $i" -Data @{ I = $i } }
+            }).AddArgument($d).AddArgument($w)
+            @{ Ps = $ps; H = $ps.BeginInvoke() }
+        }
+        foreach ($j in $jobs) { [void]$j.Ps.EndInvoke($j.H); $j.Ps.Dispose() }
+        $pool.Close()
+        $lines = @(Get-Content -LiteralPath (Get-ChildItem $d -Filter 'diag-*.log').FullName)
+        Assert-Equal 600 $lines.Count
+        Assert-Equal 600 @(Get-AuditLogEntry -Directory $d).Count 'every line must parse'
+    }
+    finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'sink receives entries with its own threshold' {
+    $q = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+    Initialize-AuditLogging -Settings @{ Level = 'Off'; ConsoleLevel = 'Off'; Sink = $q; SinkLevel = 'Verbose' }
+    Write-AuditLog -Level Verbose -Message 'to sink'
+    Write-AuditLog -Level Debug -Message 'not to sink'
+    Assert-Equal 1 $q.Count
+    Assert-Equal 'Verbose' (Get-AuditEffectiveLogLevel)
+}
+
+Test-Case 'remote log helper respects level and cap' {
+    $r = New-AuditRemoteResult
+    Write-AuditRemoteLog $r 'Debug' 'hidden' @{ LogLevel = 'Info' }
+    Write-AuditRemoteLog $r 'Warning' 'shown' @{ LogLevel = 'Info' }
+    Write-AuditRemoteLog $r 'Error' 'off' @{ LogLevel = 'Off' }
+    Assert-Equal 1 $r.Log.Count
+    for ($i = 0; $i -lt 600; $i++) { Write-AuditRemoteLog $r 'Info' "n$i" @{ LogLevel = 'Debug' } }
+    Assert-Equal 500 $r.Log.Count
+}
+
+Test-Case 'invalid log level in config is rejected' {
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('aa-cfg-' + [guid]::NewGuid().ToString('N') + '.json')
+    try {
+        Set-Content -LiteralPath $tmp -Value '{ "Logging": { "Level": "Chatty" } }' -Encoding UTF8
+        $threw = $false
+        try { Get-AuditConfig -Path $tmp | Out-Null } catch { $threw = $true }
+        Assert-True $threw
+    }
+    finally { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
+}
+
 # ============================================================================ Runner
 if (-not $SkipRunner) {
     Write-Host 'Runner'
@@ -677,7 +835,10 @@ if (-not $SkipRunner) {
     Methods = @(
         @{ Name = 'Fast'; Role = 'Primary'; Scope = 'Host'; Transports = @('Rpc'); Script = {
             param($ComputerName, $Target, $Options)
-            $r = New-AuditRemoteResult; [void]$r.Records.Add(@{ Seen = $ComputerName; Sid = $Target.Sid }); $r } }
+            $r = New-AuditRemoteResult; [void]$r.Records.Add(@{ Seen = $ComputerName; Sid = $Target.Sid })
+            Write-AuditRemoteLog $r 'Verbose' 'hello from target' $Options
+            Write-AuditRemoteLog $r 'Debug' 'too chatty' $Options
+            $r } }
         @{ Name = 'Fallback'; Role = 'CrossCheck'; Scope = 'Host'; Transports = @('WinRM', 'Rpc'); Script = {
             param($ComputerName, $Target, $Options)
             $r = New-AuditRemoteResult; [void]$r.Records.Add(@{ Via = $ComputerName }); $r } }
@@ -698,6 +859,11 @@ if (-not $SkipRunner) {
     $cfg.Collection.HostTimeoutSeconds = 4
     $cfg.Collection.ConnectTimeoutSeconds = 2
     $cfg.Collection.MaxParallelHosts = 4
+    $runnerLogDir = New-TempDir
+    $cfg.Logging.Directory = $runnerLogDir
+    $cfg.Logging.Level = 'Verbose'
+    $cfg.Logging.ConsoleLevel = 'Off'
+    Initialize-AuditLogging -Settings $cfg.Logging -RunId 'runner-test'
     $hosts = @(
         (New-AuditHostInfo -Name 'localhost' -OperatingSystemVersion '6.0 (6002)')
         (New-AuditHostInfo -Name '127.0.0.1' -IsDomainController $true)   # der "DC" haengt in Methode Slow
@@ -706,7 +872,7 @@ if (-not $SkipRunner) {
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $status = [hashtable]::Synchronized(@{})
-    $mr = @(Invoke-AuditCollection -Config $cfg -Target $Target -Hosts $hosts -CollectorNames @('Probe') -Status $status)
+    $mr = @(Invoke-AuditCollection -Config $cfg -Target $Target -Hosts $hosts -CollectorNames @('Probe') -Status $status -RunId 'runner-test')
     $sw.Stop()
     function Get-R([string]$h, [string]$m) { $mr | Where-Object { $_.Host -eq $h -and $_.Method -eq $m } | Select-Object -First 1 }
 
@@ -756,7 +922,20 @@ if (-not $SkipRunner) {
         $fb = $cov | Where-Object { $_.Method -eq 'Fallback' -and $_.Host -eq 'localhost' }
         Assert-True ($fb.Message -like '*WinRM*') $fb.Message
     }
+    Test-Case 'runner: diagnostic log covers jobs, fallbacks, timeouts and remote messages' {
+        $log = @(Get-AuditLogEntry -Directory $runnerLogDir)
+        $remote = @($log | Where-Object { $_.Component -eq 'Remote:Probe/Fast' -and $_.Message -eq 'hello from target' })
+        Assert-Equal 2 $remote.Count 'remote verbose message from both reachable hosts'
+        Assert-True (@($remote | Where-Object { $_.Host -eq 'localhost' }).Count -eq 1) 'host attribution'
+        Assert-Equal 0 @($log | Where-Object { $_.Message -eq 'too chatty' }).Count 'debug must be filtered at Verbose'
+        Assert-True (@($log | Where-Object { $_.Message -like 'Host timeout*' -and $_.Level -eq 'Warning' }).Count -eq 1) 'timeout warning'
+        Assert-True (@($log | Where-Object { $_.Message -like 'DNS resolution failed*' }).Count -eq 1) 'dns warning'
+        Assert-True (@($log | Where-Object { $_.Message -like 'Transport Rpc skipped*' }).Count -ge 1) 'skip info'
+        Assert-True (@($log | Where-Object { $_.Component -eq 'Probe/Denied' -and $_.Level -eq 'Warning' }).Count -ge 1) 'access denied warning'
+        Assert-True (@($log | Where-Object { $_.RunId -eq 'runner-t' }).Count -eq $log.Count) 'run id on every entry'
+    }
     Remove-Item -LiteralPath $tmpCollectors -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $runnerLogDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # ============================================================================ Ergebnis

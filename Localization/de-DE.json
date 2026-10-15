@@ -95,5 +95,6 @@
   "Error.NoHosts": "Der Scope enthält keine Hosts.",
   "Cli.Summary": "Lauf {0}: {1} Funde, davon {2} Diskrepanzen; {3} von {4} Prüfungen OK.",
   "Cli.SavedTo": "Gespeichert unter: {0}",
-  "Cli.CoverageProblems": "Nicht vollständig geprüft:"
+  "Cli.CoverageProblems": "Nicht vollständig geprüft:",
+  "Cli.LogHint": "Diagnose-Log: {0}  (anzeigen: .\\Show-AdminAuditLog.ps1 -RunId {1})"
 }

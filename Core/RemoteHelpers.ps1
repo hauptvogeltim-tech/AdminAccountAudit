@@ -18,9 +18,25 @@ function New-AuditRemoteResult {
     $r | Add-Member -MemberType NoteProperty -Name Truncated -Value $false
     $r | Add-Member -MemberType NoteProperty -Name Preconditions -Value @{}
     $r | Add-Member -MemberType NoteProperty -Name Notes -Value (New-Object System.Collections.ArrayList)
+    $r | Add-Member -MemberType NoteProperty -Name Log -Value (New-Object System.Collections.ArrayList)
     $r | Add-Member -MemberType NoteProperty -Name Executor -Value ([System.Environment]::MachineName)
     $r | Add-Member -MemberType NoteProperty -Name PSVersion -Value ($PSVersionTable.PSVersion.ToString())
     $r
+}
+
+function Write-AuditRemoteLog {
+    <#
+      Diagnosemeldung vom Zielhost. Wird im Ergebnis gesammelt und vom Runner mit Host und
+      Methode ins Diagnose-Log uebernommen. $Options.LogLevel begrenzt, was gesammelt wird;
+      hoechstens 500 Eintraege pro Methode.
+    #>
+    param($Result, [string]$Level, [string]$Message, $Options)
+    $ranks = @{ Off = 0; Error = 1; Warning = 2; Info = 3; Verbose = 4; Debug = 5 }
+    $max = 3
+    if ($Options -and $Options.LogLevel -and $ranks.ContainsKey([string]$Options.LogLevel)) { $max = $ranks[[string]$Options.LogLevel] }
+    if (-not $ranks.ContainsKey($Level) -or $ranks[$Level] -gt $max) { return }
+    if ($Result.Log.Count -ge 500) { return }
+    [void]$Result.Log.Add(@{ Time = (ConvertTo-AuditRemoteIso (Get-Date)); Level = $Level; Message = $Message })
 }
 
 function ConvertTo-AuditRemoteIso {

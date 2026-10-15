@@ -95,5 +95,6 @@
   "Error.NoHosts": "The scope contains no hosts.",
   "Cli.Summary": "Run {0}: {1} findings, {2} discrepancies; {3} of {4} checks OK.",
   "Cli.SavedTo": "Saved to: {0}",
-  "Cli.CoverageProblems": "Not fully checked:"
+  "Cli.CoverageProblems": "Not fully checked:",
+  "Cli.LogHint": "Diagnostic log: {0}  (view: .\\Show-AdminAuditLog.ps1 -RunId {1})"
 }

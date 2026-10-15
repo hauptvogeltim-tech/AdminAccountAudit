@@ -79,13 +79,14 @@ function ConvertTo-AuditHashtable {
 function Get-AuditProperty {
     # Liest einen Wert aus Hashtable oder Objekt, ohne bei fehlendem Feld zu werfen.
     param([object]$Object, [string]$Name, [object]$Default = $null)
+    # Komma-Operator: Collections (auch leere, z. B. eine Warteschlange) nicht ausrollen
     if ($null -eq $Object) { return $Default }
     if ($Object -is [System.Collections.IDictionary]) {
-        if ($Object.Contains($Name)) { return $Object[$Name] }
+        if ($Object.Contains($Name)) { return ,$Object[$Name] }
         return $Default
     }
     $p = $Object.PSObject.Properties[$Name]
-    if ($p) { return $p.Value }
+    if ($p) { return ,$p.Value }
     return $Default
 }
 

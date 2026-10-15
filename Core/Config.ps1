@@ -45,6 +45,15 @@ function Get-AuditDefaultConfig {
                 EvidenceSamples            = 5       # Rohbelege je aggregiertem Fund (erste + letzte N)
             }
         }
+        Logging = @{
+            # Diagnose-Log (getrennt vom Audit-Log). Level: Off | Error | Warning | Info | Verbose | Debug
+            Level         = 'Info'      # Schwelle fuer die Datei
+            ConsoleLevel  = 'Warning'   # Schwelle fuer die Konsole (CLI: -Verbose / -Debug / -ConsoleLogLevel)
+            Directory     = '%ProgramData%\AdminAccountAudit\logs'
+            Format        = 'Text'      # Text (lesbar) | Json (eine JSON-Zeile pro Eintrag)
+            MaxFileSizeMB = 20          # danach diag-<Tag>-1.log, -2.log, ...
+            RetentionDays = 30          # aeltere diag-*.log werden beim Start geloescht
+        }
         Storage = @{
             RunDirectory      = '%ProgramData%\AdminAccountAudit\runs'
             AuditLogDirectory = '%ProgramData%\AdminAccountAudit\audit'
@@ -84,6 +93,11 @@ function Get-AuditConfig {
         $override = ConvertTo-AuditHashtable ($json | ConvertFrom-Json)
         Remove-AuditCommentKey $override
         $config = Merge-AuditHashtable $config $override
+    }
+    foreach ($k in @('Level', 'ConsoleLevel')) {
+        if ($script:AuditLogLevelNames -notcontains [string]$config.Logging[$k]) {
+            throw "Logging.$k must be one of $($script:AuditLogLevelNames -join ', '), got '$($config.Logging[$k])'"
+        }
     }
     if (@('Auto', 'Legacy') -notcontains [string]$config.Collection.CompatibilityMode) {
         throw "Collection.CompatibilityMode must be 'Auto' or 'Legacy', got '$($config.Collection.CompatibilityMode)'"

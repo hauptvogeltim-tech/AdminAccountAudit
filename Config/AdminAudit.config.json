@@ -34,6 +34,15 @@
       "EvidenceSamples": 5
     }
   },
+  "Logging": {
+    "_comment": "Level/ConsoleLevel: Off | Error | Warning | Info | Verbose | Debug. Format: Text | Json",
+    "Level": "Info",
+    "ConsoleLevel": "Warning",
+    "Directory": "%ProgramData%\\AdminAccountAudit\\logs",
+    "Format": "Text",
+    "MaxFileSizeMB": 20,
+    "RetentionDays": 30
+  },
   "Storage": {
     "RunDirectory": "%ProgramData%\\AdminAccountAudit\\runs",
     "AuditLogDirectory": "%ProgramData%\\AdminAccountAudit\\audit",

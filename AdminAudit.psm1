@@ -6,7 +6,7 @@ $script:AuditModuleRoot = $PSScriptRoot
 $script:AuditModuleManifest = Join-Path $PSScriptRoot 'AdminAudit.psd1'
 $script:AuditCollectorPath = Join-Path $PSScriptRoot 'Collectors'
 
-foreach ($file in @('Common', 'Localization', 'Config', 'Finding', 'TargetAccount', 'Scope', 'CrossCheck',
+foreach ($file in @('Common', 'Localization', 'Logging', 'Config', 'Finding', 'TargetAccount', 'Scope', 'CrossCheck',
                     'RemoteHelpers', 'Runner', 'AuditLog', 'ResultStore', 'Run')) {
     . (Join-Path (Join-Path $PSScriptRoot 'Core') "$file.ps1")
 }

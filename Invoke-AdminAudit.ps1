@@ -27,6 +27,13 @@
     Methoden, die mehr voraussetzen, werden uebersprungen (Coverage 'Skipped'), es greifen die
     Fallback-Methoden. Standard ist 'Auto' (Erkennung je Host). Entspricht der spaeteren GUI-Checkbox.
 
+.PARAMETER LogLevel
+    Detailgrad des Diagnose-Logs (Datei): Off | Error | Warning | Info | Verbose | Debug.
+    Standard aus der Konfiguration (Logging.Level, ausgeliefert: Info).
+
+.PARAMETER ConsoleLogLevel
+    Detailgrad der Ausgabe auf der Konsole. Standard: Warning, mit -Verbose Verbose, mit -Debug Debug.
+
 .PARAMETER CsvPath
     Optional: Funde zusaetzlich als CSV (Semikolon, UTF-8) schreiben.
 
@@ -35,6 +42,10 @@
 
 .EXAMPLE
     .\Invoke-AdminAudit.ps1 -Language en-US
+
+.EXAMPLE
+    .\Invoke-AdminAudit.ps1 -ComputerName srv01 -LogLevel Debug -Verbose
+    Fehlersuche: alles ins Diagnose-Log (inkl. XPath-Abfragen), Verbose-Meldungen auf der Konsole.
 #>
 [CmdletBinding()]
 param(
@@ -43,6 +54,8 @@ param(
     [string[]]$Collector,
     [ValidateSet('de-DE', 'en-US')][string]$Language,
     [switch]$LegacyMode,
+    [ValidateSet('Off', 'Error', 'Warning', 'Info', 'Verbose', 'Debug')][string]$LogLevel,
+    [ValidateSet('Off', 'Error', 'Warning', 'Info', 'Verbose', 'Debug')][string]$ConsoleLogLevel,
     [string]$CsvPath
 )
 
@@ -54,6 +67,27 @@ $config = Get-AuditConfig -Path $ConfigPath
 if ($Language) { $config.Language = $Language }
 if ($LegacyMode) { $config.Collection.CompatibilityMode = 'Legacy' }
 Set-AuditLanguage $config.Language
+
+# Diagnose-Log: Datei-Level aus Parameter/Config; Konsole ueber eine Warteschlange, die der
+# Hintergrundlauf (inkl. aller Host-Jobs) befuellt und die hier ausgegeben wird.
+if ($LogLevel) { $config.Logging.Level = $LogLevel }
+if (-not $ConsoleLogLevel) {
+    $ConsoleLogLevel = $config.Logging.ConsoleLevel
+    if ($PSBoundParameters.ContainsKey('Verbose')) { $ConsoleLogLevel = 'Verbose' }
+    if ($PSBoundParameters.ContainsKey('Debug')) { $ConsoleLogLevel = 'Debug' }
+}
+$logQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+$config.Logging.Sink = $logQueue
+$config.Logging.SinkLevel = $ConsoleLogLevel
+$config.Logging.ConsoleLevel = 'Off'
+$consoleColors = @{ Error = 'Red'; Warning = 'Yellow'; Info = 'Gray'; Verbose = 'DarkGray'; Debug = 'DarkCyan' }
+function Write-QueuedLog {
+    $entry = $null
+    while ($logQueue.TryDequeue([ref]$entry)) {
+        $h = if ($entry.Host) { $entry.Host + ': ' } else { '' }
+        Write-Host ('{0} [{1}] {2}{3}' -f ([datetime]$entry.Time).ToLocalTime().ToString('HH:mm:ss'), $entry.Level.ToUpperInvariant(), $h, $entry.Message) -ForegroundColor $consoleColors[$entry.Level]
+    }
+}
 
 if ($ComputerName) {
     $config.Scope.Mode = 'List'
@@ -77,8 +111,10 @@ while (-not $handle.IsCompleted) {
     $done = [int]$status.HostsDone; $total = [int]$status.HostsTotal
     $pct = if ($total -gt 0) { [int](100 * $done / $total) } else { 0 }
     Write-Progress -Activity 'AdminAccountAudit' -Status ("{0} - {1}/{2}" -f $status.Phase, $done, $total) -PercentComplete $pct
+    Write-QueuedLog
     Start-Sleep -Milliseconds 500
 }
+Write-QueuedLog
 Write-Progress -Activity 'AdminAccountAudit' -Completed
 $run = $ps.EndInvoke($handle) | Select-Object -Last 1
 foreach ($e in $ps.Streams.Error) { Write-Error $e -ErrorAction Continue }
@@ -93,6 +129,8 @@ $ok = @($run.Coverage | Where-Object { $_.Status -eq 'Ok' })
 Write-Host ''
 Write-Host (Get-AuditString -Key 'Cli.Summary' -Arguments @($run.RunId, @($run.Findings).Count, $disc.Count, $ok.Count, @($run.Coverage).Count)) -ForegroundColor Cyan
 if ($run.SavedTo) { Write-Host (Get-AuditString -Key 'Cli.SavedTo' -Arguments @($run.SavedTo)) }
+$logDir = Expand-AuditPath $config.Logging.Directory
+if ($config.Logging.Level -ne 'Off') { Write-Host (Get-AuditString -Key 'Cli.LogHint' -Arguments @($logDir, $run.RunId.Substring(0, 8))) }
 
 $problems = @($run.Coverage | Where-Object { $_.Status -ne 'Ok' })
 if ($problems.Count -gt 0) {

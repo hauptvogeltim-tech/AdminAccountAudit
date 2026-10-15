@@ -194,7 +194,26 @@ Bekannte Grenzen (stehen auch in der Coverage):
 
 ---
 
-## 6. Nächste Schritte
+## 6. Protokollierung
+
+| Log | Datei | Inhalt | Steuerung |
+|---|---|---|---|
+| Audit-Log | `audit\audit-YYYYMM.jsonl` | Wer hat wann was abgefragt (RunStart/Scope/RunEnd/RunFailed) | immer an |
+| Diagnose-Log | `logs\diag-YYYYMMDD[-n].log` | Ablauf, Transporte, Fallbacks, Dauer, Abfragen, Remote-Meldungen | `Logging.Level` / `ConsoleLevel`: Off · Error · Warning · Info · Verbose · Debug |
+
+- `Core\Logging.ps1`: `Write-AuditLog`, `Get-AuditLogEntry`, `Set-AuditLogLevel`; Format Text oder JSON,
+  Rotation nach Größe, Aufbewahrung in Tagen, Maskierung sensibler Schlüssel.
+- Host-Jobs laufen in eigenen Runspaces und initialisieren das Logging dort neu. Schreibzugriffe
+  werden prozessweit gesperrt (Test mit 4 parallelen Schreibern).
+- Remote-Skripte sammeln Meldungen mit `Write-AuditRemoteLog` (PS-2.0-tauglich, max. 500 je Methode,
+  bereits remote nach Level gefiltert). Der Runner trägt sie als `Remote:<Kollektor>/<Methode>` mit dem Host ein.
+- Eine optionale Warteschlange (`Logging.Sink`, eigene Schwelle `SinkLevel`) liefert Einträge live an
+  die Konsole der CLI und später an das Logfenster der GUI.
+- Meldungstexte sind englisch (grep-bar, unabhängig von der UI-Sprache).
+
+---
+
+## 7. Nächste Schritte
 
 1. Testlauf in der Domäne mit `Invoke-AdminAudit.ps1`, Rückmeldung zu
    Coverage-Lücken (WinRM/RPC, Rechte, Audit-Policy).

@@ -51,8 +51,11 @@
                 $res.Preconditions['LogFileSizeBytes'] = $info.FileSize
                 $res.Preconditions['LogRecordCount'] = $info.RecordCount
                 $res.Preconditions['LogOldest'] = $info.Oldest
+                Write-AuditRemoteLog $res 'Verbose' ('Security log: mode ' + $info.LogMode + ', ' + $info.RecordCount + ' records, ' + $info.FileSize + ' of ' + $info.MaximumSize + ' bytes, oldest ' + $info.Oldest) $Options
 
-                $events = Invoke-AuditWinEvent -ComputerName $ComputerName -FilterXml (New-AuditQueryList $selects) -MaxEvents $max
+                $filterXml = New-AuditQueryList $selects
+                Write-AuditRemoteLog $res 'Debug' ('FilterXml: ' + $filterXml) $Options
+                $events = Invoke-AuditWinEvent -ComputerName $ComputerName -FilterXml $filterXml -MaxEvents $max
                 $seen = @{}
                 foreach ($e in $events) {
                     $k = [string]$e.RecordId
@@ -67,8 +70,10 @@
                     $oldest = $null
                     foreach ($e in $events) { if ($null -eq $oldest -or $e.TimeCreated -lt $oldest) { $oldest = $e.TimeCreated } }
                     $res.WindowStart = $oldest
+                    Write-AuditRemoteLog $res 'Warning' ('MaxEventsPerQuery (' + $max + ') reached - window shortened to ' + $oldest) $Options
                 }
                 $res.WindowEnd = ConvertTo-AuditRemoteIso (Get-Date)
+                Write-AuditRemoteLog $res 'Verbose' ('Matching security events: ' + $res.Records.Count) $Options
 
                 # Wurde das Log geleert? (1102)
                 try {
@@ -77,6 +82,7 @@
                         $c = @($cleared)[0]
                         $res.Preconditions['LastCleared'] = $c.TimeCreated
                         $res.Preconditions['LastClearedBy'] = [string]$c.SubjectDomainName + '\' + [string]$c.SubjectUserName
+                        Write-AuditRemoteLog $res 'Warning' ('Security log was cleared at ' + $c.TimeCreated + ' by ' + $res.Preconditions['LastClearedBy']) $Options
                     }
                 }
                 catch { $res.Preconditions['LastCleared'] = 'unknown: ' + $_.Exception.Message }
@@ -112,8 +118,17 @@
                                 }
                             }
                         }
-                        if ($policy.Count -eq 0) { $res.Preconditions['AuditPolicy'] = 'unknown (auditpol returned no data)' }
-                        else { $res.Preconditions['AuditPolicy'] = $policy }
+                        if ($policy.Count -eq 0) {
+                            $res.Preconditions['AuditPolicy'] = 'unknown (auditpol returned no data)'
+                            Write-AuditRemoteLog $res 'Warning' 'auditpol returned no data (not elevated?)' $Options
+                        }
+                        else {
+                            $res.Preconditions['AuditPolicy'] = $policy
+                            foreach ($k in $policy.Keys) {
+                                if (-not $policy[$k].Success) { Write-AuditRemoteLog $res 'Warning' ('Audit policy: success auditing is OFF for ' + $k + ' (' + $policy[$k].Raw + ')') $Options }
+                                else { Write-AuditRemoteLog $res 'Debug' ('Audit policy ' + $k + ': ' + $policy[$k].Raw) $Options }
+                            }
+                        }
                     }
                     catch { $res.Preconditions['AuditPolicy'] = 'unknown: ' + $_.Exception.Message }
                 }
@@ -141,7 +156,11 @@
                 foreach ($l in $logs) {
                     try { $info = Get-AuditLogInfo -ComputerName $ComputerName -LogName $l.Name }
                     catch {
-                        if ((Get-AuditErrorKind $_) -eq 'NotSupported') { [void]$res.Notes.Add('log not present: ' + $l.Name); continue }
+                        if ((Get-AuditErrorKind $_) -eq 'NotSupported') {
+                            [void]$res.Notes.Add('log not present: ' + $l.Name)
+                            Write-AuditRemoteLog $res 'Verbose' ('Log not present: ' + $l.Name) $Options
+                            continue
+                        }
                         throw
                     }
                     $found++
@@ -167,6 +186,7 @@
                 }
                 if ($found -eq 0) { throw 'AUDIT_NOTSUPPORTED: no TerminalServices operational logs on this host' }
                 $res.Preconditions['EventsScanned'] = $scanned
+                Write-AuditRemoteLog $res 'Verbose' ('TerminalServices logs: ' + $scanned + ' events scanned, ' + $res.Records.Count + ' for the target account') $Options
                 $res.WindowEnd = ConvertTo-AuditRemoteIso (Get-Date)
                 $res
             }
@@ -199,6 +219,7 @@
                 }
                 $res.WindowStart = $info.Oldest
                 $res.WindowEnd = ConvertTo-AuditRemoteIso (Get-Date)
+                Write-AuditRemoteLog $res 'Verbose' ('Winlogon 7001/7002: ' + $res.Records.Count + ' events, system log oldest ' + $info.Oldest) $Options
                 $res
             }
         }
@@ -240,11 +261,16 @@
                             $f = Get-Item -LiteralPath (Join-Path $p 'NTUSER.DAT') -Force -ErrorAction Stop
                             $rec['NtUserDatLastWrite'] = ConvertTo-AuditRemoteIso $f.LastWriteTimeUtc
                         }
-                        catch { $rec['NtUserDatError'] = $_.Exception.Message }
+                        catch {
+                            $rec['NtUserDatError'] = $_.Exception.Message
+                            Write-AuditRemoteLog $res 'Verbose' ('NTUSER.DAT not readable: ' + $_.Exception.Message) $Options
+                        }
+                        Write-AuditRemoteLog $res 'Verbose' ('Profile key ' + $keyName + ': ' + $rec['ProfileImagePath'] + ', loaded ' + $rec['LoadTime']) $Options
                         [void]$res.Records.Add($rec)
                         $k.Close()
                     }
                     $pl.Close()
+                    if ($res.Records.Count -eq 0) { Write-AuditRemoteLog $res 'Verbose' 'No profile for the target account on this host' $Options }
                 }
                 finally { if ($ComputerName) { $base.Close() } }
                 $res.WindowEnd = ConvertTo-AuditRemoteIso (Get-Date)
@@ -313,6 +339,7 @@
                 catch { }
 
                 [void]$res.Records.Add($rec)
+                Write-AuditRemoteLog $res 'Verbose' ('lastLogon=' + $rec['lastLogon'] + ' logonCount=' + $rec['logonCount'] + ' badPasswordTime=' + $rec['badPasswordTime'] + ' pwdLastSet=' + $rec['pwdLastSet']) $Options
                 $res.WindowEnd = ConvertTo-AuditRemoteIso (Get-Date)
                 $res
             }
@@ -691,6 +718,9 @@
                     [void]$out.Add($f)
                 }
             }
+
+            Write-AuditLog -Level Verbose -Component 'Logon/Analyze' -HostName $hn -Message ("{0} security observations, {1} local-account events ignored, {2} unmatched session events, security window from {3}" -f `
+                $obs.Count, $localIgnored, $secondaryLeftovers.Count, $(if ($secWindow) { ConvertTo-AuditIsoString $secWindow.Start } else { 'unavailable' }))
 
             if ($hi.IsDomainController) {
                 $dcData[$hn] = @{ Obs = $obs; Window = $secWindow; Ad = (Get-MethodResult $hn 'ADAttributes'); Sec = $sec }
