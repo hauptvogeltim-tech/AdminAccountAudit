@@ -220,6 +220,9 @@ die komplette Logon-Analyse mit synthetischen Ereignissen, das Diagnose-Log
 
 ## Dokumentation
 
+- [README.html](README.html) – diese Seite als eigenständige HTML-Datei, Diagramme als eingebettete Grafik
+  (offline lesbar, kein Skript nötig). Nach Änderungen an der README neu erzeugen:
+  `python3 tools/build_readme_html.py` (braucht pandoc und Mermaid-CLI)
 - [docs/Design.md](docs/Design.md) – Architektur, Datenmodell, Kollektor-Vertrag, Abgleichsregeln
 - [docs/Rechte-und-Voraussetzungen.md](docs/Rechte-und-Voraussetzungen.md) – Rechte, Ports, Verhalten bei Fehlern
 - [Collectors/_Template.Collector.ps1](Collectors/_Template.Collector.ps1) – Vorlage für neue Kollektoren
