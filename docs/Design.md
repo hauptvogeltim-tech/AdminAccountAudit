@@ -1,248 +1,206 @@
-# AdminAccountAudit – Architekturentwurf (zur Abnahme)
+# AdminAccountAudit – Architektur
 
-Status: **Entwurf v0.1** – noch kein Code. Offene Punkte sind mit **[OFFEN]**
-markiert und hängen an den Rückfragen.
-
----
-
-## 1. Grundsatzentscheidungen (Vorschlag)
-
-| Thema | Vorschlag | Begründung |
-|---|---|---|
-| PowerShell (Audit-Arbeitsplatz) | **Windows PowerShell 5.1**, PS 7 wird geduldet, aber nicht garantiert | `ActiveDirectory` und vor allem `GroupPolicy` laufen unter PS 7 nur über die WinPS-Compat-Session (implicit remoting → deserialisierte Objekte, `Get-GPOReport` funktioniert, aber langsam/fragil). WPF unter 5.1 ist erprobt. |
-| PowerShell (Zielhosts) | Remote-Skriptblöcke **PS-2.0-kompatibel** geschrieben, Fähigkeiten werden pro Host erkannt | Bei einer 20 Jahre alten Domäne sind 2008/2008 R2 wahrscheinlich. `Get-ScheduledTask` gibt es erst ab 2012 → dort greift automatisch die XML/schtasks-Methode. **[OFFEN: ältestes OS]** |
-| GUI | **WPF** (XAML-Dateien getrennt vom Code-Behind) | Gewünscht; saubere Trennung, `DataGrid` + `ICollectionView` liefern Filter/Sortierung/Spaltenwahl nahezu geschenkt. Das bestehende UniFi-Tool im Repo nutzt WinForms – das Audit-Tool ist davon unabhängig. |
-| SMTP | **`System.Net.Mail.SmtpClient`** hinter einer kleinen Transport-Abstraktion | In .NET Framework enthalten, keine DLLs zu verteilen/freizugeben. Microsoft rät für *neue* Entwicklung davon ab, weil moderne Protokolle fehlen (kein implizites TLS auf 465, kein OAuth). Für einen internen Relay mit STARTTLS/587 oder 25 reicht es. Die Abstraktion erlaubt später einen MailKit-Transport, falls DLLs erlaubt sind. **[OFFEN]** |
-| Remote-Transport | **WinRM/PSRemoting primär**; optionaler, pro Methode deklarierter **RPC/DCOM-Fallback** (`Get-WinEvent -ComputerName`, CIM-über-DCOM, Remote-Registry) | Der Fallback ist gleichzeitig eine *unabhängige* Zweitquelle. Ob er erlaubt ist, steht in der Konfiguration. **[OFFEN]** |
-| Konto-Identifikation | **SID-basiert** (Domänen-SID + RID 500), Namen nur als Zusatz | Das Konto kann umbenannt sein, und auf jedem Memberserver gibt es ein *lokales* „Administrator“ (ebenfalls RID 500, aber ein anderes Konto). Namensvergleich allein führt zu falschen Treffern. |
-| Persistenz der Ergebnisse | Jeder Lauf schreibt eine **Ergebnisdatei (JSON)**; die GUI kann mehrere Läufe zusammenführen | Security-Logs auf DCs rollen oft nach Stunden bis wenigen Tagen über. Ein belastbares Bild entsteht erst durch wiederholte Läufe über Wochen. |
+Status: **v0.2** – Antworten auf die Rückfragen eingearbeitet, Kern und
+Referenz-Kollektor `Logon` implementiert. GUI und Reporting folgen.
 
 ---
 
-## 2. Projektstruktur
+## 1. Festgelegte Rahmenbedingungen
+
+| Thema | Entscheidung |
+|---|---|
+| Zielkonto | Nur der Domänen-Administrator `<NETBIOS>\Administrator`, identifiziert über **Domänen-SID + RID 500** (umbenennungsfest). Lokale RID-500-Konten der Server sind ein anderes Konto und werden standardmäßig nicht gemeldet (`IncludeLocalAdministrator`). |
+| Umgebung | Eine Domäne, < 30 Server, 2 DCs. Server 2008 ist vorhanden → Remote-Code ist **PowerShell-2.0-kompatibel**. |
+| PowerShell (Audit-Arbeitsplatz) | **Windows PowerShell 5.1**. PS 7 wird geduldet, aber nicht garantiert. |
+| Kein RSAT nötig | AD-Zugriffe über ADSI/`DirectorySearcher`, nicht über das ActiveDirectory-Modul (GroupPolicy-Modul erst im GPO-Kollektor). |
+| Remote-Transport | **WinRM zuerst, RPC/DCOM als Fallback** – je Methode deklariert und protokolliert, welcher Transport tatsächlich griff. |
+| Identität | Gesammelt wird mit der Identität, unter der das Skript gestartet wurde (Kerberos, keine Passwörter im Speicher). Das Konto braucht die nötigen Rechte (siehe `Rechte-und-Voraussetzungen.md`). Läuft das Tool unter dem Zielkonto selbst, warnt es (die eigenen Anmeldungen würden das Ergebnis verfälschen). |
+| Autorisierung (GUI) | Eine Rolle für alle: Mitgliedschaft in einer konfigurierbaren AD-Gruppe. Einstellungen werden pro Benutzer-SID gespeichert. |
+| Mail | `System.Net.Mail.SmtpClient`, anonymer interner Relay, keine externen DLLs (kein MailKit). |
+| Sprache | Oberfläche, Report und Fundtexte umschaltbar **de-DE / en-US**. Code-Bezeichner Englisch. |
+| Zusätzliche Quellen | CrowdStrike Falcon / Identity Protection: Exporte werden später als eigener Import-Kollektor eingelesen (Format klären, sobald ein Beispielexport vorliegt). |
+
+---
+
+## 2. Projektstruktur (Ist-Stand)
 
 ```
 AdminAccountAudit/
-├─ Start-AdminAudit.cmd              # Launcher: powershell.exe 5.1, -STA, -NoProfile
-├─ AdminAudit.ps1                    # Einstieg: Config laden → Login → Hauptfenster
-├─ AdminAudit.psd1 / .psm1           # Kernmodul (lädt Core/*, Collectors/*, Reporting/*)
-│
-├─ Config/
-│  ├─ AdminAudit.config.json         # Org-Konfiguration (Gruppe, Zielkonten, SMTP, Scope, Timeouts)
-│  └─ AdminAudit.config.schema.md    # Beschreibung aller Schlüssel
-│
+├─ Invoke-AdminAudit.ps1          # Kommandozeilen-Einstieg (bis die GUI steht)
+├─ AdminAudit.psd1 / .psm1        # Kernmodul
+├─ Config/AdminAudit.config.json  # Org-Konfiguration (überlagert eingebaute Defaults)
+├─ Localization/de-DE.json, en-US.json
 ├─ Core/
-│  ├─ Finding.ps1                    # New-AuditFinding / New-AuditCoverage / Test-AuditFinding (Schema)
-│  ├─ TargetAccount.ps1              # Auflösung Zielkonto(en): SID, sAMAccountName, UPN, NetBIOS-Varianten,
-│  │                                 #   Test-IsTargetAccount (Domain vs. lokal, Match-Qualität)
-│  ├─ CrossCheck.ps1                 # Compare-AuditObservations → Confirmed / OnlyPrimary / OnlySecondary / Conflict
-│  ├─ Scope.ps1                      # Resolve-AuditScope: Einzelhost | Liste | OU | ganze Domäne | DCs
-│  ├─ Runner.ps1                     # RunspacePool, Timeout pro Host, Dispatch Remote/Lokal, Fehlerkapselung
-│  ├─ CollectorRegistry.ps1          # Lädt Collectors/*.Collector.ps1, prüft Manifest
-│  ├─ AuditLog.ps1                   # Eigenes Audit-Log (wer hat wann was abgefragt), JSON-Lines
-│  ├─ Auth.ps1                       # ValidateCredentials + rekursive Gruppenprüfung
-│  ├─ UserSettings.ps1               # %APPDATA%\AdminAccountAudit\<SID>.json
-│  └─ ResultStore.ps1                # Lauf-Ergebnisse speichern/laden/zusammenführen
-│
+│  ├─ Common.ps1                  # Zeit-/Pfad-/Objekt-Hilfen
+│  ├─ Localization.ps1            # Get-AuditString, Sprachwechsel
+│  ├─ Config.ps1                  # Defaults + JSON-Überlagerung
+│  ├─ Finding.ps1                 # Finding / Coverage / Evidence / Confidence-Regeln
+│  ├─ TargetAccount.ps1           # Zielkonto per SID, Zuordnung von Fundstellen
+│  ├─ Scope.ps1                   # Single | List | OU | AllComputers | AllServers (+ DCs)
+│  ├─ CrossCheck.ps1              # Timeline-, Zeitpunkt- und Schlüsselabgleich
+│  ├─ RemoteHelpers.ps1           # PS-2.0-Hilfen, die mit jedem Remote-Skript mitlaufen
+│  ├─ Runner.ps1                  # RunspacePool, Transport-Fallback, Timeout pro Host
+│  ├─ AuditLog.ps1                # Audit-Log des Tools (JSON Lines)
+│  ├─ ResultStore.ps1             # Läufe speichern / laden / zusammenführen
+│  └─ Run.ps1                     # Invoke-AdminAuditRun: ein kompletter Lauf
 ├─ Collectors/
-│  ├─ _Template.Collector.ps1        # Vorlage für neue Kollektoren
-│  ├─ Logon.Collector.ps1            # (Referenz) Security-Log Zielhosts + DCs, Cross-Check AD-Attribute
-│  ├─ ScheduledTask.Collector.ps1
-│  ├─ Service.Collector.ps1
-│  ├─ Netlogon.Collector.ps1
-│  ├─ Gpo.Collector.ps1
-│  ├─ Autostart.Collector.ps1
-│  └─ (später) IisAppPool, Dcom, StoredCredential, MappedDrive, SqlService …
-│
-├─ Gui/
-│  ├─ LoginWindow.xaml
-│  ├─ MainWindow.xaml
-│  ├─ SettingsWindow.xaml
-│  ├─ Themes/Light.xaml, Dark.xaml
-│  └─ Gui.ps1                        # Code-Behind, Bindings, Filterlogik
-│
-├─ Reporting/
-│  ├─ Export-AuditCsv.ps1
-│  ├─ Export-AuditHtml.ps1           # HTML mit Diskrepanz-Block ganz oben
-│  ├─ Templates/Report.html
-│  └─ Send-AuditReport.ps1           # SmtpClient-Transport
-│
-├─ tests/                            # Pester 5 (nur Entwicklung) + Beispiel-Eventdaten
+│  ├─ _Template.Collector.ps1
+│  └─ Logon.Collector.ps1         # Referenzmuster
+├─ tests/Test-AdminAudit.ps1      # ohne Pester, läuft auch unter Linux-pwsh
 └─ docs/
-   ├─ Design.md                      # dieses Dokument
-   └─ Rechte-und-Voraussetzungen.md  # benötigte Rechte, Firewall, Verhalten bei Unerreichbarkeit
 ```
 
-Laufzeitdaten (nicht im Repo):
+Geplant: `Gui/` (WPF/XAML), `Reporting/` (HTML/CSV/SMTP), weitere Kollektoren.
+
+Laufzeitdaten (konfigurierbar):
 
 ```
-%APPDATA%\AdminAccountAudit\settings\<UserSID>.json     # per-User-GUI-Einstellungen
-%ProgramData%\AdminAccountAudit\runs\<RunId>.json       # Ergebnisse je Lauf  (Pfad konfigurierbar)
-%ProgramData%\AdminAccountAudit\audit\audit-YYYYMM.jsonl# Audit-Log des Tools
+%ProgramData%\AdminAccountAudit\runs\run-<Zeit>-<RunId>.json   # Ergebnisse je Lauf
+%ProgramData%\AdminAccountAudit\audit\audit-YYYYMM.jsonl      # Audit-Log des Tools
+%APPDATA%\AdminAccountAudit\settings\<UserSID>.json           # GUI-Einstellungen je Benutzer
 ```
 
 ---
 
-## 3. Einheitliches Datenmodell
+## 3. Datenmodell
 
-Es gibt **drei** Objektarten. Die geforderten acht Felder sind in allen
-Fund-Objekten vorhanden und stehen immer zuerst.
+### 3.1 `AuditFinding`
 
-### 3.1 `AuditFinding` – ein Fund
-
-| Feld | Typ | Pflicht | Bedeutung |
-|---|---|---|---|
-| **Source** | string | ✔ | Kollektor, z. B. `Logon`, `ScheduledTask`, `Service`, `Gpo` |
-| **Host** | string | ✔ | FQDN des Hosts, auf dem der Fund gemacht wurde (bei GPO: Domäne/DC) |
-| **Account** | string | ✔ | Kontoangabe *wie gefunden* (z. B. `CORP\Administrator`, `.\Administrator`, `Administrator@corp.local`) |
-| **ObjectType** | string | ✔ | `LogonEvent`, `ADLogonAttribute`, `ScheduledTask`, `Service`, `GpoSetting`, `AutostartEntry`, `NetlogonEntry`, … |
-| **Detail** | string | ✔ | Einzeilige, menschenlesbare Beschreibung |
-| **Timestamp** | datetime (UTC) | ✔ | Zeitpunkt *des Ereignisses* (Event-Zeit, Task-Letzter-Lauf, …); `$null`, wenn es keinen gibt (z. B. Dienstkonfiguration) |
-| **Method** | string | ✔ | Konkrete Methode, z. B. `WinEvent/WinRM`, `WinEvent/RPC`, `CIM/Win32_Service`, `Registry/ObjectName`, `TaskXml`, `schtasks.exe` |
-| **Confidence** | enum | ✔ | `High` / `Medium` / `Low` – Definition siehe 3.4 |
-| FindingId | guid | ✔ | Eindeutige ID |
-| RunId | guid | ✔ | Zuordnung zum Sammellauf |
-| CollectedAt | datetime (UTC) | ✔ | Zeitpunkt der Erhebung (≠ Timestamp) |
-| CollectedBy | string | ✔ | Identität, unter der gesammelt wurde |
-| CollectorVersion | string | ✔ | Version des Kollektors |
-| AccountSid | string | – | Aufgelöste SID, falls bestimmbar |
-| AccountScope | enum | ✔ | `Domain` / `Local` / `Unresolved` – trennt Domänen-Administrator vom lokalen RID-500 |
-| AccountMatch | enum | ✔ | `Sid` / `Name` / `Ambiguous` – wie der Treffer zustande kam |
-| CorrelationKey | string | ✔ | Schlüssel für den Abgleich (z. B. `srv01|\Microsoft\Backup\Nightly`) |
-| CrossCheck | enum | ✔ | `Confirmed` / `OnlyPrimary` / `OnlySecondary` / `Conflict` / `NotChecked` / `SecondaryUnavailable` |
-| CrossCheckNote | string | – | Worin sich die Quellen unterscheiden |
-| Attributes | hashtable | ✔ | Strukturierte, quellenspezifische Felder (filterbar), z. B. `LogonType`, `LogonTypeName`, `SourceIp`, `WorkstationName`, `EventId`, `TaskPath`, `ServiceName`, `StartMode`, `GpoGuid` |
-| Evidence | object[] | ✔ | Rohbeobachtungen *aller* beteiligten Methoden inkl. Methode/Zeit – nichts wird stillschweigend aufgelöst |
-
-Ein Beispiel (Logon, beide Quellen):
-
-```powershell
-[pscustomobject]@{
-    Source           = 'Logon'
-    Host             = 'dc01.corp.local'
-    Account          = 'CORP\Administrator'
-    ObjectType       = 'LogonEvent'
-    Detail           = 'Logon Type 10 (RDP) von 10.1.2.33 / WS-IT-04'
-    Timestamp        = [datetime]'2026-10-14T06:12:09Z'
-    Method           = 'WinEvent/WinRM'
-    Confidence       = 'High'
-    FindingId        = '…'
-    RunId            = '…'
-    CollectedAt      = [datetime]'2026-10-15T08:00:31Z'
-    CollectedBy      = 'CORP\svc-adminaudit'
-    CollectorVersion = '1.0.0'
-    AccountSid       = 'S-1-5-21-…-500'
-    AccountScope     = 'Domain'
-    AccountMatch     = 'Sid'
-    CorrelationKey   = 'dc01.corp.local|Logon'
-    CrossCheck       = 'Confirmed'
-    CrossCheckNote   = 'lastLogon(dc01)=2026-10-14T06:12:09Z deckt sich mit jüngstem 4624'
-    Attributes       = @{ EventId = 4624; LogonType = 10; LogonTypeName = 'RemoteInteractive'
-                          SourceIp = '10.1.2.33'; WorkstationName = 'WS-IT-04'; LogonId = '0x3e7a1' }
-    Evidence         = @( … )
-}
-```
-
-### 3.2 `AuditCoverage` – was wurde *tatsächlich* geprüft
-
-Pro **Host × Kollektor × Methode** genau ein Coverage-Datensatz, auch wenn
-nichts gefunden wurde. Erst er macht „0 Treffer“ von „nicht prüfbar“
-unterscheidbar (Prinzip *degradiert sauber*).
+Die acht geforderten Felder stehen immer zuerst (wird getestet).
 
 | Feld | Bedeutung |
 |---|---|
-| RunId, Source, Host, Method, CollectedAt, CollectedBy | Provenienz |
-| Status | `Ok` / `Unreachable` / `AccessDenied` / `Timeout` / `NotSupported` / `Error` / `Skipped` |
-| ResultCount | Anzahl Rohbeobachtungen (0 ist bei `Ok` eine gültige Aussage) |
-| WindowStart / WindowEnd | Abgedeckter Zeitraum (z. B. ältestes Event im Security-Log) – bei Eventlog-Quellen Pflicht |
-| Preconditions | z. B. Audit-Policy „Logon“ Erfolg/Fehler aktiv? Log zuletzt geleert (Event 1102)? Logon-Count-Replikation? |
-| Message | Fehlermeldung / Hinweis |
+| **Source** | Kollektor (`Logon`, …) |
+| **Host** | FQDN, auf dem gefunden wurde (bei domänenweiten Attributen: DNS-Name der Domäne) |
+| **Account** | Kontoangabe *wie gefunden* (`CORP\Administrator`, `administrator@CORP.LOCAL`, …) |
+| **ObjectType** | `LogonEvent`, `DcAuthEvent`, `AccountEvent`, `SessionEvent`, `UserProfile`, `ADAttribute`, `ADAccount` (weitere Kollektoren ergänzen eigene) |
+| **Detail** | Menschenlesbarer Text in der aktuellen Sprache |
+| **Timestamp** | Zeitpunkt des Ereignisses (UTC); bei aggregierten Funden das jüngste |
+| **Method** | Methode + tatsächlich genutzter Transport, z. B. `SecurityLog (WinRM)`, `ProfileList (Rpc)` |
+| **Confidence** | `High` / `Medium` / `Low` (Regeln in 3.4) |
+| FindingId, RunId, CollectedAt, CollectedBy, CollectorVersion | Provenienz |
+| AccountSid, AccountScope (`Domain`/`Local`/`Unresolved`), AccountMatch (`Sid`/`Name`/`Ambiguous`) | Wie sicher der Bezug zum Zielkonto ist |
+| CorrelationKey | Schlüssel für Abgleich und für das Zusammenführen mehrerer Läufe |
+| CrossCheck, CrossCheckNote | Ergebnis der Gegenprobe (3.3) |
+| DetailKey, DetailArgs | Sprachneutrale Form von Detail → Neu-Rendern bei Sprachwechsel |
+| Attributes | Strukturierte, filterbare Felder: `EventId`, `LogonType`, `SourceIp`, `Workstation`, `Count`, `FirstSeen`, `LastSeen`, `RecordIds`, `Privileged`, … |
+| Evidence | Rohbelege aller beteiligten Methoden (Methode, Rolle, Host, Transport, Rohdatensatz). Bei aggregierten Funden die ersten und letzten N Einzelereignisse, `RecordIds` vollständig. |
 
-Beispiel: `Security-Log auf srv07 ok, 0 Treffer, Zeitraum 13.10. 22:10 – 15.10. 08:00, Audit-Policy Logon=Success` →
-Aussage „in diesen 34 h keine Anmeldung“, nicht „nie angemeldet“.
+**Aggregation:** Gleichartige Ereignisse (gleicher Host, EventID, Logon-Type,
+Quell-IP, Workstation, Status, Dienst …) werden zu einem Fund mit `Count`,
+`FirstSeen` und `LastSeen` zusammengefasst. Das ergibt die Abhängigkeitslandkarte
+(„von wo wird das Konto wie benutzt“), ohne die Einzelereignisse zu verlieren.
 
-### 3.3 `AuditRun` – ein Sammellauf
+### 3.2 `AuditCoverage`
 
-`RunId, StartedAt, EndedAt, StartedBy, ToolVersion, ScopeDefinition, ResolvedHosts,
-TargetAccounts (SID/Namen), CollectorsEnabled, Config-Hash, Findings[], Coverage[]`
+Ein Datensatz pro **Host × Kollektor × Methode**, auch bei 0 Treffern. Der Kern
+erzeugt ihn automatisch aus jedem Methodenergebnis. Ein Kollektor kann das
+also nicht vergessen.
 
-### 3.4 Confidence – feste Definition
+`Status` (`Ok`/`Unreachable`/`AccessDenied`/`Timeout`/`NotSupported`/`Error`/`Skipped`),
+`Transport`, `ResultCount`, `WindowStart`/`WindowEnd` (abgedeckter Zeitraum),
+`Truncated`, `Preconditions` (Log-Größe/Modus, zuletzt geleert, effektive
+Audit-Policy, WinRM-Zustand, Remote-PS-Version), `Message` (inkl. Fallback-Gründe).
+
+### 3.3 Cross-Check-Zustände
+
+| Zustand | Bedeutung | Im Report als Diskrepanz |
+|---|---|---|
+| `Confirmed` | Beide Quellen sehen dasselbe | |
+| `Partial` | Aggregat: nur ein Teil der Einzelereignisse bestätigt | ✔ |
+| `OnlyPrimary` | Gegenprobe lief und deckt den Zeitraum ab, sieht es aber nicht | ✔ |
+| `OnlySecondary` | Nur die Gegenprobe sieht es | ✔ |
+| `Conflict` | Quellen widersprechen sich inhaltlich | ✔ |
+| `NotChecked` | Es gibt keine unabhängige Zweitquelle, oder der Zeitpunkt liegt außerhalb ihres Zeitfensters | |
+| `Unverifiable` | Eine Zweitquelle gibt es, sie war aber nicht verfügbar (Fehler/unerreichbar) | |
+
+### 3.4 Confidence
 
 | Wert | Bedingung |
 |---|---|
-| **High** | Treffer per SID **und** Cross-Check `Confirmed` – oder eine autoritative Quelle mit SID-Treffer, deren Gegenprobe prinzipbedingt nicht existiert |
-| **Medium** | Eine Methode, eindeutiger Treffer (SID oder eindeutig auflösbarer Name), Gegenprobe `NotChecked`/`SecondaryUnavailable` |
-| **Low** | Nur Namens-Treffer ohne SID (z. B. Textfund in Netlogon-Log oder Skript in SYSVOL), `Ambiguous`, oder Cross-Check `Conflict` |
-
-Ein `Conflict` erhöht nie die Confidence, sondern landet zusätzlich im
-Diskrepanz-Block des Reports.
+| **High** | SID-Treffer und `Confirmed` – oder autoritative Einzelquelle per SID (z. B. Kontoattribute aus dem AD) |
+| **Medium** | Eindeutiger Treffer (SID oder Name mit passender Domäne), Gegenprobe nicht bestätigend |
+| **Low** | `Ambiguous` (Name ohne Domänenkontext) oder `Conflict` |
 
 ---
 
 ## 4. Kollektor-Vertrag
 
-Ein Kollektor = eine Datei `Collectors/<Name>.Collector.ps1`, die ein
-Manifest zurückgibt. Der Kern kümmert sich um Remoting, Timeouts, Fehler,
-Provenienz und Cross-Check; der Kollektor liefert nur Rohdaten und
-Zuordnungsregeln.
+Ein Kollektor ist eine Datei `Collectors\<Name>.Collector.ps1`, die ein Manifest
+zurückgibt (Vorlage: `_Template.Collector.ps1`).
 
-```powershell
-@{
-    Name        = 'ScheduledTask'
-    Version     = '1.0.0'
-    Scope       = 'Host'          # Host | DomainController | Domain (einmal pro Domäne, lokal)
-    ObjectType  = 'ScheduledTask'
-    Methods     = @(
-        @{ Name = 'ScheduledTasks/CIM'; Role = 'Primary';   Transport = 'WinRM'
-           MinOS = '6.2'; RemoteScript = { param($Target) … } }   # liefert Rohobjekte
-        @{ Name = 'TaskXml';            Role = 'CrossCheck'; Transport = 'WinRM'
-           RemoteScript = { param($Target) … } }
-        @{ Name = 'schtasks.exe';       Role = 'CrossCheck'; Transport = 'WinRM'
-           RemoteScript = { param($Target) … } }
-    )
-    CorrelationKey = { param($Obs) '{0}|{1}' -f $Obs.Host, $Obs.TaskPath }
-    Compare        = { param($Primary, $Secondary) … }   # liefert Unterschiede je Feld
-    ToFinding      = { param($Obs) … }                   # Rohobjekt → Detail/Attributes
-}
-```
+- `Methods[]`: `Name`, `Role` (`Primary`/`CrossCheck`), `Scope` (`Host`/`DomainController`),
+  `Transports` (Reihenfolge = Fallback), `Script`.
+- `Script` läuft auf dem Ziel (WinRM) oder lokal mit `$ComputerName` (Rpc/Ldap).
+  Der Runner setzt `Core\RemoteHelpers.ps1` davor. Das Skript ist PS-2.0-kompatibel
+  (wird statisch getestet), rein lesend und liefert genau ein `New-AuditRemoteResult`.
+- `Analyze` läuft lokal mit allen Methodenergebnissen und erzeugt die Funde.
+- Fehlerbehandlung, Timeouts, Coverage und Provenienz übernimmt der Kern.
 
-Regeln:
+**Kompatibilitätsmodus** (`Collection.CompatibilityMode`, CLI `-LegacyMode`, später GUI-Checkbox
+„Abwärtskompatibilitätsmodus“): Methoden können `MinPSVersion` (gilt für die Ausführung auf dem
+Ziel per WinRM) und `MinOSVersion` (Vergleich mit `operatingSystemVersion` aus dem AD) deklarieren.
 
-- `RemoteScript` ist eigenständig (keine Abhängigkeit auf Modulfunktionen),
-  PS-2.0-kompatibel und **ausschließlich lesend**.
-- Das Zielkonto wird als `$Target` (SIDs + alle Namensvarianten)
-  übergeben; Filterung möglichst schon remote (XPath-Filter bei Eventlogs),
-  damit nicht ganze Logs übertragen werden.
-- Jede Methode läuft in eigenem `try/catch` im Runner; ein Fehler erzeugt
-  einen Coverage-Datensatz mit Status, nie einen Abbruch.
-- Ein neuer Kollektor braucht keine Änderung an Kern, GUI oder Report.
+| Modus | Verhalten |
+|---|---|
+| `Auto` (Standard) | Remote-PS-Version (aus der WinRM-Sitzung) und OS-Version je Host erkennen. Methoden mit höheren Anforderungen werden dort übersprungen, es greifen die Fallback-Methoden. Unbekannte Version → Methode läuft. |
+| `Legacy` | Jeder Host wird wie Server 2008 / PowerShell 2.0 behandelt. Für den Fall, dass die Erkennung nicht vertrauenswürdig ist (z. B. veraltete OS-Angaben im AD). |
+
+Eine übersprungene Methode erscheint in der Coverage als `Skipped` mit Begründung. Die von ihr
+abhängigen Gegenproben werden `Unverifiable` und gelten nie als „nichts gefunden“.
+Methoden ohne `MinPSVersion` müssen PS-2.0-kompatibel sein (statischer Test), sie laufen also überall.
+Neuere PowerShell-Versionen werden auf den Zielen bewusst **nicht** installiert (Read-only-Prinzip;
+PS 7 unterstützt Server 2008/2008 R2 ohnehin nicht).
+
+**Transport-Fallback:** Der nächste Transport wird nur versucht, wenn der Fehler
+am Transport lag (keine WinRM-Session, RPC nicht erreichbar). Ein „Zugriff
+verweigert“ wird dagegen direkt als Status gemeldet und nicht über einen anderen
+Weg verschleiert.
 
 ---
 
-## 5. Referenz-Kollektor `Logon` (Planung für Schritt 3)
+## 5. Referenz-Kollektor `Logon`
 
-| Teil | Methode | Inhalt |
-|---|---|---|
-| Primär, Zielhosts | `Get-WinEvent -FilterXml` über WinRM (Fallback RPC) | 4624, 4625, 4634, 4647, 4672 – XPath auf `TargetUserSid`/`SubjectUserSid` **und** `TargetUserName` (4625 hat oft keine SID) |
-| Primär, DCs | wie oben | 4768, 4769, 4776 → welcher Client (IP/Workstation) wann gegen das Konto authentifiziert hat |
-| Preconditions | `auditpol /get` (remote), Event 1102 (Log geleert), ältestes Event | Coverage-Zeitfenster, Hinweis bei deaktivierter Überwachung |
-| Cross-Check | AD-Attribute: `lastLogon` **je DC** (Maximum), `lastLogonTimestamp`, `logonCount` je DC, `pwdLastSet`, `whenChanged`, `badPasswordTime` | Abgleich: jüngstes Event je DC vs. `lastLogon` dieses DCs; `lastLogonTimestamp` (bis 14 Tage Verzug) als grobe Plausibilisierung |
+| Methode | Rolle | Ort | Inhalt |
+|---|---|---|---|
+| `SecurityLog` | Primär | jeder Host | 4624, 4625, 4634, 4647, 4648, 4672; auf DCs zusätzlich 4768, 4769, 4771, 4776, 4740, 4723, 4724, 4738. XPath-Filter auf SID bzw. Namensvarianten. Coverage: Log-Zeitfenster, Größe, Modus, zuletzt geleert (1102), effektive Audit-Policy (`auditpol /r`, nur über WinRM). |
+| `TerminalServicesLog` | Gegenprobe | jeder Host | LocalSessionManager 21–25, RemoteConnectionManager 1149 |
+| `WinlogonSystemLog` | Gegenprobe | jeder Host | System-Log Winlogon 7001/7002 (UserSid) |
+| `ProfileList` | Gegenprobe | jeder Host | Registry-Profil des Kontos (inkl. `.bak`), Ladezeit, NTUSER.DAT-Zeitstempel. Reicht weiter zurück als jedes Eventlog. |
+| `ADAttributes` | Gegenprobe | jeder DC (LDAP) | `lastLogon`, `logonCount`, `badPasswordTime`, `badPwdCount` (je DC), `lastLogonTimestamp`, `pwdLastSet` + Replikationsmetadaten, `userAccountControl`, SPNs |
 
-Bewusste Abweichungen, die *nicht* als Konflikt gelten (dokumentiert, nicht
-verschluckt): `lastLogonTimestamp`-Replikationsverzug, Netzwerk-Logons, die
-`lastLogon` nicht aktualisieren, Events außerhalb des Log-Zeitfensters.
+Abgleiche:
+
+| Aussage | Primär | Gegenprobe | Regel |
+|---|---|---|---|
+| Interaktive/RDP-Anmeldung (Typ 2/10/11, 7 bei Reconnect) | 4624 | LSM 21/25, RCM 1149, Winlogon 7001 | Zeitreihe, ±120 s, jede Quelle einzeln, Ergebnis zusammengeführt |
+| Sitzung ohne 4624 | – | LSM/RCM/Winlogon | `OnlySecondary`, wenn das Security-Log den Zeitpunkt abdeckt |
+| 4672 (Sonderrechte) | – | – | wird an die 4624 mit gleicher LogonId gehängt (`Privileged`) |
+| Profil-Ladezeit | ProfileList | 4624 Typ 2/4/5/10/11 | ±300 s; Profil fehlt trotz interaktiver Anmeldungen → `Conflict` |
+| `lastLogon` je DC | AD | 4768/4776 (Erfolg) auf diesem DC | Zeitpunkt-Abgleich ±300 s |
+| `badPasswordTime` je DC | AD | 4771/4625/4776 (Fehler) auf diesem DC | Zeitpunkt-Abgleich |
+| `pwdLastSet` | AD (alle DCs) | Gleichheit über DCs + 4723/4724 | unterschiedliche Werte → `Conflict` |
+| `lastLogonTimestamp` | AD | Maximum aller `lastLogon` | muss innerhalb des Sync-Intervalls liegen |
+| Netzwerk-, Dienst- und Batch-Logons | 4624 | – | keine unabhängige Zweitquelle auf dem Host → `NotChecked` (die Domänensicht liefern die DC-Ereignisse) |
+
+Bekannte Grenzen (stehen auch in der Coverage):
+
+- XPath vergleicht Werte case-sensitiv. Es werden die üblichen Schreibweisen
+  abgefragt; exotische Mischschreibung bei Namens-Ereignissen (4625/4776/4769)
+  kann durchrutschen. SID-basierte Ereignisse sind davon nicht betroffen.
+- Per RPC lässt sich die Audit-Policy nicht lesen (`unknown (RPC transport)`).
+- Ist `MaxEventsPerQuery` erreicht, wird `Truncated` gesetzt und das Zeitfenster
+  auf das älteste gelieferte Ereignis verkürzt.
 
 ---
 
-## 6. Eigene Spuren des Tools
+## 6. Nächste Schritte
 
-- Die Sammlung läuft **nicht** unter `Administrator`, sondern unter einem
-  eigenen Audit-Konto (sonst verfälscht das Tool sein eigenes Ergebnis).
-- Anmeldungen des Audit-Kontos werden in Findings nicht als Treffer gezählt,
-  aber im Audit-Log festgehalten.
-
----
-
-## 7. Offene Rückfragen
-
-Siehe Gesprächsverlauf; Antworten fließen in v0.2 dieses Dokuments ein.
+1. Testlauf in der Domäne mit `Invoke-AdminAudit.ps1`, Rückmeldung zu
+   Coverage-Lücken (WinRM/RPC, Rechte, Audit-Policy).
+2. Kollektoren Geplante Aufgaben, Dienste, Netlogon, GPO, Autostart nach dem
+   Muster von `Logon`.
+3. GUI (WPF): Login + Gruppenprüfung, Grid mit Filtern, Einstellungen je Benutzer,
+   Sprachumschaltung, Laden/Zusammenführen gespeicherter Läufe.
+4. Reporting: HTML mit Diskrepanz-Block oben, CSV, SMTP-Versand.
+5. Import-Kollektor für CrowdStrike-Exporte.

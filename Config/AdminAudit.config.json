@@ -1,0 +1,49 @@
+{
+  "_comment": "Org-Konfiguration. Nicht aufgefuehrte Schluessel nehmen die eingebauten Standardwerte (Core/Config.ps1).",
+  "Language": "de-DE",
+  "Authorization": {
+    "AllowedGroup": "GG-AdminAccountAudit"
+  },
+  "TargetAccount": {
+    "Rid": 500
+  },
+  "IncludeLocalAdministrator": false,
+  "Scope": {
+    "_comment": "Mode: Single | List | OU | AllComputers | AllServers",
+    "Mode": "AllServers",
+    "Hosts": [],
+    "SearchBase": "",
+    "IncludeDomainControllers": true,
+    "OnlyEnabled": true
+  },
+  "Collection": {
+    "MaxParallelHosts": 8,
+    "HostTimeoutSeconds": 900,
+    "ConnectTimeoutSeconds": 20,
+    "_CompatibilityMode": "Auto = je Host erkennen | Legacy = alle Hosts wie Server 2008 / PowerShell 2.0 behandeln",
+    "CompatibilityMode": "Auto"
+  },
+  "Collectors": {
+    "Logon": {
+      "Enabled": true,
+      "LookbackDays": 0,
+      "MaxEventsPerQuery": 100000,
+      "CrossCheckToleranceSeconds": 120,
+      "DcAttributeToleranceSeconds": 300,
+      "ProfileToleranceSeconds": 300,
+      "EvidenceSamples": 5
+    }
+  },
+  "Storage": {
+    "RunDirectory": "%ProgramData%\\AdminAccountAudit\\runs",
+    "AuditLogDirectory": "%ProgramData%\\AdminAccountAudit\\audit",
+    "SettingsDirectory": "%APPDATA%\\AdminAccountAudit\\settings"
+  },
+  "Smtp": {
+    "Host": "",
+    "Port": 25,
+    "From": "",
+    "To": [],
+    "EnableStartTls": false
+  }
+}
